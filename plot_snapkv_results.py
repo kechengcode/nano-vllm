@@ -2,8 +2,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
-RESULTS_FILE = "snapkv_sweep_results.csv"
-OUTPUT_IMAGE = "snapkv_throughput_chart.png"
+RESULTS_FILE = "/root/qwen3-8b-snapkv_sweep_results.csv"
+OUTPUT_IMAGE = "qwen3-8b-snapkv_throughput_chart.png"
 
 def plot_results():
     if not os.path.exists(RESULTS_FILE):
