@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
+import math
 import triton
 import triton.language as tl
 
@@ -88,50 +90,108 @@ class Attention(nn.Module):
         limit = context.snapkv_limit
         if limit is None or limit <= 0:
             return torch.ones(k.shape[0], dtype=torch.bool, device=k.device)
+        
         cu = context.cu_seqlens_q
         device = k.device
         H = self.num_heads
         Hkv = self.num_kv_heads
         scale = self.scale
+        
+        # SnapKV Hyperparameters (aligned with reference defaults)
+        window_size = 8
+        kernel_size = 7
+        pooling = 'avgpool'
+        
         mask = torch.zeros(k.shape[0], dtype=torch.bool, device=device)
-        # Process each sequence independently to avoid huge attention matrices
+        
+        # Process each sequence independently
         for i in range(cu.numel() - 1):
             start = cu[i].item()
             end = cu[i + 1].item()
             L = end - start
+            
+            # If sequence fits in limit, keep everything
             if L <= limit:
                 mask[start:end] = True
                 continue
-            sample_q = context.snapkv_sample_queries or 128
-            sample_q = min(sample_q, L)
-            # Take the last `sample_q` queries for importance estimation
-            q_seq = q[end - sample_q:end]                  # [sample_q, H, D]
-            k_seq = k[start:end]                           # [L, Hkv, D]
-            # Expand KV heads to match Q heads if needed (GQA)
+            
+            # 1. Determine Observation Window
+            valid_window = min(window_size, L)
+            
+            # Edge case: if limit is extremely small (smaller than window), just keep last 'limit'
+            if limit <= valid_window:
+                mask[end - limit:end] = True
+                continue
+                
+            # 2. Compute Selection for History
+            # We want to keep `limit - valid_window` tokens from the history part.
+            capacity_history = limit - valid_window
+            
+            # Prepare Queries (Observation Window) -> [H, W, D]
+            # Select last `valid_window` queries
+            q_window = q[end - valid_window:end].transpose(0, 1)
+            
+            # Prepare Keys (All) -> [H, L, D]
+            # Since nanovllm uses packed KV, we extract the sequence slice.
+            k_seq = k[start:end]
+            # Handle GQA/MQA by repeating keys to match query heads if needed
             if Hkv != H:
-                assert H % Hkv == 0
                 rep = H // Hkv
-                k_seq = k_seq.repeat_interleave(rep, dim=1)  # [L, H, D]
-            # Compute causal attention scores over keys for sampled queries
-            # qh: [H, sample_q, D], kh: [H, L, D]
-            qh = q_seq.transpose(0, 1)
-            kh = k_seq.transpose(0, 1)
-            # logits: [H, sample_q, L]
-            logits = torch.matmul(qh, kh.transpose(-1, -2)) * scale
-            # Build causal mask: keys allowed for query at absolute pos p_q
-            # Absolute positions of sampled queries: [L - sample_q, ..., L - 1]
-            abs_q = torch.arange(L - sample_q, L, device=device)
-            abs_k = torch.arange(L, device=device)
-            allowed = (abs_k.unsqueeze(0) <= abs_q.unsqueeze(1))  # [sample_q, L]
-            logits.masked_fill_(~allowed.unsqueeze(0), float("-inf"))
-            attn = torch.softmax(logits, dim=-1)  # softmax over keys
-            # Importance per key: sum over heads and sampled queries
-            importance = attn.sum(dim=(0, 1))  # [L]
-            # Select top-`limit` keys to keep
-            topk = torch.topk(importance, k=limit, largest=True)
-            keep_idx = topk.indices.sort().values
-            seq_mask = mask[start:end]
-            seq_mask[keep_idx] = True
+                k_seq = k_seq.repeat_interleave(rep, dim=1)
+            # Transpose to [H, D, L] for matmul
+            k_seq_t = k_seq.transpose(0, 1).transpose(1, 2)
+            
+            # Compute Attention Scores [H, W, L]
+            # Queries attend to all keys in the sequence
+            attn_scores = torch.matmul(q_window, k_seq_t) * scale
+            
+            # Apply Causal Mask to the window-window interaction
+            # The window queries are at absolute positions [L-W, ..., L-1]
+            # The keys are at absolute positions [0, ..., L-1]
+            # We need to mask where key_pos > query_pos
+            # This only affects the last `valid_window` columns of the keys
+            big_neg = torch.finfo(attn_scores.dtype).min
+            window_causal_mask = torch.triu(torch.ones(valid_window, valid_window, device=device, dtype=torch.bool), diagonal=1)
+            attn_scores[:, :, -valid_window:].masked_fill_(window_causal_mask.unsqueeze(0), big_neg)
+            
+            # Compute Softmax results [H, W, L]
+            attn_probs = torch.softmax(attn_scores, dim=-1)
+            
+            # 3. Calculate Importance
+            # We only care about the history part for selection (keys 0 to L-W-1)
+            history_len = L - valid_window
+            # Slice to get history probs [H, W, History_Len]
+            history_probs = attn_probs[:, :, :history_len]
+            
+            # Sum over observation window queries -> [H, History_Len]
+            importance_per_head = history_probs.sum(dim=1)
+            
+            # Aggregate across heads (since we store KV slots for all heads at once) -> [History_Len]
+            importance_global = importance_per_head.sum(dim=0)
+            
+            # 4. Pooling (AvgPool or MaxPool) with kernel_size
+            # Input needs to be [Minibatch, Channels, Length] -> [1, 1, History_Len]
+            imp_input = importance_global.view(1, 1, -1)
+            
+            if pooling == 'avgpool':
+                imp_pooled = F.avg_pool1d(imp_input, kernel_size=kernel_size, padding=kernel_size//2, stride=1)
+            elif pooling == 'maxpool':
+                imp_pooled = F.max_pool1d(imp_input, kernel_size=kernel_size, padding=kernel_size//2, stride=1)
+            else:
+                imp_pooled = imp_input # fallback
+            
+            imp_pooled = imp_pooled.squeeze() # [History_Len]
+            
+            # 5. Top-K Selection
+            k_val = min(capacity_history, imp_pooled.numel())
+            if k_val > 0:
+                topk = torch.topk(imp_pooled, k=k_val, largest=True)
+                keep_indices = topk.indices # Indices relative to start of sequence
+                mask[start + keep_indices] = True
+                
+            # 6. Always keep the Observation Window
+            mask[end - valid_window : end] = True
+            
         return mask
 
     def build_compact_slot_mapping(self, context, keep_mask: torch.Tensor) -> torch.Tensor:
