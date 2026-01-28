@@ -9,9 +9,10 @@ from tqdm import tqdm
 from nanovllm import LLM, SamplingParams
 
 # Constants
-MODEL_PATH = "/root/autodl-tmp/models/Qwen3-0.6B"
+MODEL_PATH = "/root/autodl-tmp/models/qwen3-8b"
 RESULTS_FILE = "snapkv_throughput_and_maxbatch_v3.csv"
-INPUT_LENGTHS = [2000, 4000, 6000, 8000, 10000]
+#INPUT_LENGTHS = [2000, 4000, 6000, 8000, 10000]
+INPUT_LENGTHS = [20000]
 COMPRESSION_RATES = [2, 4, 8, 16, 32, 64]
 # Make sure we have enough requests to potentially hit the max batch size
 # If TOTAL_REQUESTS is too small, the system might finish before ramping up fully.
@@ -23,8 +24,8 @@ COMPRESSION_RATES = [2, 4, 8, 16, 32, 64]
 # Let's stick to 256 to be consistent with the "v1" reference, unless it proves too small to hit max batch.
 # Actually, for 10k input, 256 is plenty. For 2k x64 compression, 256 might run fast.
 # Let's keep it 256 as per the v1 "TOTAL_REQUESTS" reference. 
-TOTAL_REQUESTS = 256 
-OUTPUT_LEN = 500
+TOTAL_REQUESTS = 512
+OUTPUT_LEN = 512
 
 def run_benchmark_v3(input_len, use_snapkv, compression_rate=None):
     torch.cuda.empty_cache()
@@ -155,26 +156,26 @@ def main():
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             
-    # 1. Baseline (SnapKV OFF)
-    for length in tqdm(INPUT_LENGTHS, desc="Baseline Sweeps", file=sys.stdout):
-        res = run_benchmark_v3(length, use_snapkv=False)
-        if res:
-            with open(RESULTS_FILE, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writerow(res)
-            # tqdm.write(f"  Result: TPT={res['throughput']:.0f} tok/s, MaxBS={res['max_batch_size']}")
-
-    # 2. SnapKV Sweeps
-    total_runs = len(INPUT_LENGTHS) * len(COMPRESSION_RATES)
-    with tqdm(total=total_runs, desc="SnapKV Sweeps", file=sys.stdout) as pbar:
+    # Combined Sweeps: Loop through Lengths -> (Baseline + Rates)
+    total_runs = len(INPUT_LENGTHS) * (1 + len(COMPRESSION_RATES))
+    
+    with tqdm(total=total_runs, desc="Benchmark Sweeps", file=sys.stdout) as pbar:
         for length in INPUT_LENGTHS:
+            # 1. Baseline (SnapKV OFF)
+            res = run_benchmark_v3(length, use_snapkv=False)
+            if res:
+                with open(RESULTS_FILE, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writerow(res)
+            pbar.update(1)
+
+            # 2. SnapKV Sweeps
             for rate in COMPRESSION_RATES:
                 res = run_benchmark_v3(length, use_snapkv=True, compression_rate=rate)
                 if res:
                     with open(RESULTS_FILE, 'a', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames)
                         writer.writerow(res)
-                    # tqdm.write(f"  Result: TPT={res['throughput']:.0f} tok/s, MaxBS={res['max_batch_size']}")
                 pbar.update(1)
 
     print(f"\nBenchmark v3 completed. Results saved to {RESULTS_FILE}")

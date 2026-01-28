@@ -8,8 +8,9 @@ import csv
 from nanovllm import LLM, SamplingParams
 
 # Constants
-MODEL_PATH = "/root/autodl-tmp/models/Qwen3-0.6B"
-RESULTS_FILE = "snapkv_sweep_results.csv"
+#MODEL_PATH = "/root/autodl-tmp/models/Qwen3-0.6B"
+MODEL_PATH = "/root/autodl-tmp/models/qwen3-8b"
+RESULTS_FILE = "qwen3-8b-snapkv_sweep_results.csv"
 INPUT_LENGTHS = [2000, 4000, 6000, 8000, 10000]
 COMPRESSION_RATES = [2, 4, 8, 16, 32, 64]
 TOTAL_REQUESTS = 256
